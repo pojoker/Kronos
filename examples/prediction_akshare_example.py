@@ -1,32 +1,40 @@
 """AkShare-powered batch prediction workflow for Kronos.
 
-This script reads JSON files located alongside it, extracts the
-``time``, ``title`` and ``code_name`` fields, downloads the corresponding
-A-share OHLCV history via AkShare, and generates three business days of
-Kronos forecasts per entry.  The output is written to a consolidated
-JSON file containing the original metadata plus the predicted price
-series.
+This module can be executed as a standalone script or imported into a
+Jupyter notebook.  When imported, helper functions are exposed so that
+you can interactively load JSON event records, prepare the Kronos
+predictor, and generate forecasts without touching the filesystem unless
+you explicitly choose to.
 
-Usage
------
-1. Install AkShare alongside the project requirements::
+Notebook quick-start
+=====================
 
-       pip install -r requirements.txt akshare
+1. Install dependencies::
 
-2. Place one or more JSON files in the same directory as this script.
-   Each JSON file should contain a list (or dictionary with a ``data``
-   list) of entries that include at least the ``time``, ``title`` and
-   ``code_name`` fields.  Additional keys (``content``, ``company_chn_name``
-   etc.) will be preserved in the output.
+       %pip install -r requirements.txt akshare
 
-3. Run the script::
+2. Import helpers and load a predictor::
 
-       python examples/prediction_akshare_example.py
+       from examples.prediction_akshare_example import (
+           load_json_records,
+           load_kronos_predictor,
+           predict_records,
+       )
+       predictor = load_kronos_predictor()
 
-   The script will create ``akshare_predictions.json`` containing the
-   enriched records.  For each entry the forecast window starts on the
-   event date unless the event timestamp is later than 15:00:00, in
-   which case the window begins on the next business day.
+3. Supply records and display predictions::
+
+       records = load_json_records(Path("path/to/json_dir"))
+       results = predict_records(records, predictor)
+       results[0]["predicted_prices"]
+
+CLI usage
+=========
+
+Running ``python examples/prediction_akshare_example.py`` keeps the
+previous behaviour: JSON files located alongside the script are
+processed and the enriched records are written to
+``akshare_predictions.json``.
 """
 
 from __future__ import annotations
@@ -51,6 +59,24 @@ except NameError:  # pragma: no cover - triggered in interactive sessions
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.append(str(_PROJECT_ROOT))
 from model import Kronos, KronosTokenizer, KronosPredictor
+
+__all__ = [
+    "LOOKBACK_DAYS",
+    "PREDICTION_LENGTH",
+    "REQUIRED_FIELDS",
+    "fetch_a_share_daily",
+    "load_json_records",
+    "normalise_symbol",
+    "parse_event_time",
+    "ensure_series",
+    "determine_forecast_start",
+    "build_prediction_payload",
+    "enrich_record_with_prediction",
+    "load_kronos_predictor",
+    "predict_records",
+    "predict_directory",
+    "save_predictions",
+]
 
 LOOKBACK_DAYS = 300
 PREDICTION_LENGTH = 3
@@ -256,42 +282,120 @@ def enrich_record_with_prediction(
     return enriched
 
 
-def main(input_dir: str | Path | None = None, output_path: str | Path | None = None) -> None:
-    script_dir = Path(__file__).resolve().parent
-    input_directory = Path(input_dir) if input_dir is not None else script_dir
-    output_file = Path(output_path) if output_path is not None else script_dir / "akshare_predictions.json"
+def load_kronos_predictor(
+    *, device: str | None = None, max_context: int = 512
+) -> KronosPredictor:
+    """Instantiate ``KronosPredictor`` for interactive use.
 
-    records = load_json_records(input_directory)
-    if not records:
-        print(f"No JSON records found in {input_directory}. Nothing to predict.")
-        return
+    Parameters
+    ----------
+    device:
+        Optional device string (``"cpu"``, ``"cuda:0"`` 等)。若未提供则
+        根据 ``torch.cuda.is_available`` 自动选择。
+    max_context:
+        历史窗口的最大长度，默认 512，对应 Kronos-small 的限制。
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"Loading Kronos models on device: {device}")
+    Returns
+    -------
+    KronosPredictor
+        已加载的预测器，可在 Notebook 中复用。
+    """
+
+    resolved_device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Loading Kronos models on device: {resolved_device}")
     tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
     model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-    predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+    return KronosPredictor(model, tokenizer, device=resolved_device, max_context=max_context)
 
+
+def predict_records(
+    records: Sequence[MutableMapping[str, Any]],
+    predictor: KronosPredictor | None = None,
+    *,
+    device: str | None = None,
+    data_cache: Dict[str, pd.DataFrame] | None = None,
+    on_error: str = "include",
+) -> List[Dict[str, Any]]:
+    """Generate predictions for in-memory records.
+
+    Parameters
+    ----------
+    records:
+        事件列表，每个元素需包含 ``time``、``title``、``code_name`` 字段。
+    predictor:
+        已初始化的 ``KronosPredictor``。若缺省则会调用
+        :func:`load_kronos_predictor`。
+    device:
+        当 ``predictor`` 缺省时用于加载模型的设备字符串。
+    data_cache:
+        可选的行情缓存字典，可在多次调用之间复用以减少 AkShare 请求。
+    on_error:
+        ``"include"``（默认）表示在结果中保留失败记录并附带 ``prediction_error``；
+        ``"skip"`` 表示忽略失败记录；``"raise"`` 会在第一条失败时立即抛出异常。
+
+    Returns
+    -------
+    list of dict
+        与输入对应的一组 enriched 记录。
+    """
+
+    if predictor is None:
+        predictor = load_kronos_predictor(device=device)
+
+    cache = data_cache if data_cache is not None else {}
     enriched_records: List[Dict[str, Any]] = []
-    data_cache: Dict[str, pd.DataFrame] = {}
 
     for record in records:
         try:
-            enriched = enrich_record_with_prediction(record, predictor, data_cache)
-        except Exception as exc:
-            print(
-                f"Skipping record with code_name={record.get('code_name')}: {exc}")
+            enriched_records.append(enrich_record_with_prediction(record, predictor, cache))
+        except Exception as exc:  # pragma: no cover - network errors, data issues
+            if on_error == "raise":
+                raise
+            if on_error == "skip":
+                continue
             errored = dict(record)
             errored["prediction_error"] = str(exc)
             enriched_records.append(errored)
-        else:
-            enriched_records.append(enriched)
 
+    return enriched_records
+
+
+def predict_directory(
+    input_dir: str | Path,
+    predictor: KronosPredictor | None = None,
+    **predict_kwargs: Any,
+) -> List[Dict[str, Any]]:
+    """Convenience wrapper to load JSON files from a directory and predict."""
+
+    directory = Path(input_dir)
+    records = load_json_records(directory)
+    if not records:
+        print(f"No JSON records found in {directory}. Nothing to predict.")
+        return []
+    return predict_records(records, predictor, **predict_kwargs)
+
+
+def save_predictions(records: Sequence[Dict[str, Any]], output_path: str | Path) -> Path:
+    """Persist enriched predictions to ``output_path`` and return the path."""
+
+    output_file = Path(output_path)
     output_file.write_text(
-        json.dumps(enriched_records, ensure_ascii=False, indent=2),
+        json.dumps(list(records), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"Saved {len(enriched_records)} records to {output_file}")
+    print(f"Saved {len(records)} records to {output_file}")
+    return output_file
+
+
+def main(input_dir: str | Path | None = None, output_path: str | Path | None = None) -> None:
+    script_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    input_directory = Path(input_dir) if input_dir is not None else script_dir
+    output_file = Path(output_path) if output_path is not None else script_dir / "akshare_predictions.json"
+
+    predictor = load_kronos_predictor()
+    enriched_records = predict_directory(input_directory, predictor)
+    if enriched_records:
+        save_predictions(enriched_records, output_file)
 
 
 if __name__ == "__main__":
