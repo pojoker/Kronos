@@ -1,3 +1,4 @@
+
 """Simple AkShare + Kronos batch prediction script.
 
 This script keeps the original CLI usage (``python examples/prediction_akshare_example.py``)
@@ -5,6 +6,21 @@ while staying friendly to Jupyter notebooks.  Place one or multiple JSON files i
 the ``examples`` directory (or supply a custom path) and each record containing
 ``time``, ``title`` and ``code_name`` will be enriched with three days of predicted
 prices from the Kronos-small model.
+
+"""Example script for running Kronos predictions with A-share data from AkShare.
+
+This script downloads historical OHLCV data for a single A-share using AkShare,
+converts it into the format expected by :class:`KronosPredictor`, and then
+generates a forecast window tailored to the requested future dates. The
+predicted OHLCVA series is saved as a tab-separated ``.txt`` file alongside the
+script.
+
+Requirements
+------------
+The script depends on ``akshare`` in addition to the core Kronos
+requirements.  Install it via ``pip install akshare`` before running the
+example.
+
 """
 
 from __future__ import annotations
@@ -82,6 +98,7 @@ def fetch_a_share_daily(symbol: str) -> pd.DataFrame:
     except Exception as exc:  # pragma: no cover - network failures
         raise RuntimeError(
             "Failed to download data from AkShare. Check your internet connectivity "
+
             "or proxy settings and retry."
         ) from exc
 
@@ -95,6 +112,7 @@ def fetch_a_share_daily(symbol: str) -> pd.DataFrame:
         "成交额": "amount",
     }
     df = raw_df.rename(columns=rename_map)
+
     df = df[list(rename_map.values())].copy()
     df["timestamps"] = pd.to_datetime(df["timestamps"], utc=False)
 
@@ -271,5 +289,7 @@ def main() -> None:
     save_predictions(enriched, args.output)
 
 
+
 if __name__ == "__main__":
     main()
+
