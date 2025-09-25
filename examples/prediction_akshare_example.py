@@ -42,7 +42,14 @@ import pandas as pd
 from pandas.tseries.offsets import BusinessDay
 import torch
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Resolve the project root even when ``__file__`` is undefined (e.g. in notebooks).
+try:
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+except NameError:  # pragma: no cover - triggered in interactive sessions
+    _PROJECT_ROOT = Path.cwd().resolve()
+
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
 from model import Kronos, KronosTokenizer, KronosPredictor
 
 LOOKBACK_DAYS = 300
